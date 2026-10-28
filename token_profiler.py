@@ -1872,14 +1872,35 @@ def build_html_report_data(conn: sqlite3.Connection, days: int = 14) -> Dict[str
             if n == 0 or sum(series) == 0:
                 zeros = [0.0] * forecast_days
                 return zeros, zeros, zeros, 0.0, 0.0
+
+            # Exclude or normalize the partial current day (series[-1]) so early-day runs
+            # do not treat a few hours of usage as a full-day drop.
+            if n > 1:
+                completed = list(series[:-1])
+                today_raw = series[-1]
+                elapsed_frac = max(0.15, (now_dt.hour * 3600 + now_dt.minute * 60 + now_dt.second) / 86400.0)
+                hist_mean = sum(completed) / len(completed)
+                if today_raw > 0:
+                    today_est = min(max(today_raw, hist_mean * 1.5), today_raw / elapsed_frac)
+                    fit_series = completed + [0.5 * today_est + 0.5 * hist_mean]
+                else:
+                    fit_series = completed
+            else:
+                fit_series = list(series)
+
+            fn = len(fit_series)
+            if fn == 0 or sum(fit_series) == 0:
+                zeros = [0.0] * forecast_days
+                return zeros, zeros, zeros, 0.0, 0.0
+
             # Compute Exponential Moving Average (alpha = 0.35)
             alpha = 0.35
-            ema = series[0]
-            for val in series[1:]:
+            ema = fit_series[0]
+            for val in fit_series[1:]:
                 ema = alpha * val + (1.0 - alpha) * ema
-            # Compute linear regression slope over the last min(n, 10) days
-            w = min(n, 10)
-            sub = series[-w:]
+            # Compute linear regression slope over the last min(fn, 10) completed/normalized days
+            w = min(fn, 10)
+            sub = fit_series[-w:]
             x_mean = (w - 1) / 2.0
             y_mean = sum(sub) / w
             num = sum((i - x_mean) * (sub[i] - y_mean) for i in range(w))
@@ -2147,17 +2168,21 @@ def build_html_report_data(conn: sqlite3.Connection, days: int = 14) -> Dict[str
     cur_wow = get_period_metrics(conn, r7_start, now)
     prv_wow = get_period_metrics(conn, prev7_start, r7_start)
 
-    # 8. Top Sessions & Post-Mortem Anomalies
+    # 8. Top Sessions (up to 20 per account so no account tab is starved) & Post-Mortem Anomalies
     sess_rows = conn.execute(
         """
-        SELECT account, session_id, project_slug, start_ts, end_ts, turn_count, subagent_count,
-               (input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens) AS total_tok,
-               cache_creation_tokens, cache_read_tokens, output_tokens, subagent_total_tokens,
-               subagent_cost_usd, total_cost_usd
-        FROM sessions
-        WHERE end_ts >= ? AND turn_count >= 1
+        WITH ranked_sessions AS (
+            SELECT account, session_id, project_slug, start_ts, end_ts, turn_count, subagent_count,
+                   (input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens) AS total_tok,
+                   cache_creation_tokens, cache_read_tokens, output_tokens, subagent_total_tokens,
+                   subagent_cost_usd, total_cost_usd,
+                   ROW_NUMBER() OVER (PARTITION BY account ORDER BY total_cost_usd DESC) AS rn
+            FROM sessions
+            WHERE end_ts >= ? AND turn_count >= 1
+        )
+        SELECT * FROM ranked_sessions
+        WHERE rn <= 20
         ORDER BY total_cost_usd DESC
-        LIMIT 40
         """,
         (since_ts,),
     ).fetchall()
@@ -2551,17 +2576,40 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       return '$' + Number(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     }
 
+    function esc(v) {
+      return String(v ?? '').replace(/[&<>"']/g, ch => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;'
+      }[ch]));
+    }
+
+    function showChartOfflineFallback(canvasId) {
+      const canvas = document.getElementById(canvasId);
+      if (!canvas || !canvas.parentElement) return;
+      canvas.parentElement.innerHTML =
+        '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:0.85rem;text-align:center;padding:16px;">Chart.js CDN unavailable offline — KPI cards, forecasts, WoW tables, post-mortem incidents, and session tables remain active below.</div>';
+    }
+
     function init() {
       document.getElementById('report-meta').textContent =
         `Generated: ${DATA.generated_at} • Lookback: Last ${DATA.days} Days • Accounts: ${DATA.accounts.join(', ')}`;
 
       const tabsEl = document.getElementById('account-tabs');
       const allTabs = ['ALL', ...DATA.accounts];
-      tabsEl.innerHTML = allTabs.map(acct => `
-        <button class="tab-btn ${acct === currentAccount ? 'active' : ''}" onclick="selectAccount('${acct}', this)">
-          ${acct === 'ALL' ? 'All Accounts' : acct}
+      tabsEl.innerHTML = allTabs.map((acct, idx) => `
+        <button class="tab-btn ${acct === currentAccount ? 'active' : ''}" data-acct-idx="${idx}">
+          ${acct === 'ALL' ? 'All Accounts' : esc(acct)}
         </button>
       `).join('');
+      tabsEl.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const acct = allTabs[Number(btn.getAttribute('data-acct-idx'))] || 'ALL';
+          selectAccount(acct, btn);
+        });
+      });
 
       renderAll();
     }
@@ -2648,7 +2696,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     function renderForecastChart() {
-      const ctx = document.getElementById('forecastChart').getContext('2d');
+      if (typeof Chart === 'undefined') {
+        showChartOfflineFallback('forecastChart');
+        return;
+      }
+      const canvas = document.getElementById('forecastChart');
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
       if (forecastChartInst) forecastChartInst.destroy();
 
       const histLabels = DATA.day_labels.map(d => d.slice(5));
@@ -2682,6 +2736,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           label: currentAccount,
           data: [...s, ...Array(futLen).fill(null)],
           backgroundColor: ACCT_COLORS[currentAccount] || '#38bdf8',
+          stack: 'hist',
           borderRadius: 4
         });
       }
@@ -2694,6 +2749,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         type: 'line',
         label: '7-Day Forecast (EMA + Trend)',
         data: forecastLine,
+        stack: 'forecast',
         borderColor: '#f59e0b',
         backgroundColor: 'rgba(245, 158, 11, 0.15)',
         borderDash: [6, 4],
@@ -2708,6 +2764,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           type: 'line',
           label: 'High-Burst Band (+0.75σ)',
           data: highLine,
+          stack: 'band',
           borderColor: 'rgba(244, 63, 94, 0.45)',
           borderDash: [3, 3],
           borderWidth: 1.5,
@@ -2747,7 +2804,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     function renderHourlyChart() {
-      const ctx = document.getElementById('hourlyChart').getContext('2d');
+      if (typeof Chart === 'undefined') {
+        showChartOfflineFallback('hourlyChart');
+        return;
+      }
+      const canvas = document.getElementById('hourlyChart');
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
       if (hourlyChartInst) hourlyChartInst.destroy();
 
       const hData = DATA.hourly[currentAccount] || DATA.hourly['ALL'];
@@ -2783,7 +2846,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     function renderActorChart() {
-      const ctx = document.getElementById('actorChart').getContext('2d');
+      if (typeof Chart === 'undefined') {
+        showChartOfflineFallback('actorChart');
+        return;
+      }
+      const canvas = document.getElementById('actorChart');
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
       if (actorChartInst) actorChartInst.destroy();
 
       const list = (DATA.actors[currentAccount] || DATA.actors['ALL'] || []).slice(0, 8);
@@ -2809,7 +2878,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     function renderToolChart() {
-      const ctx = document.getElementById('toolChart').getContext('2d');
+      if (typeof Chart === 'undefined') {
+        showChartOfflineFallback('toolChart');
+        return;
+      }
+      const canvas = document.getElementById('toolChart');
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
       if (toolChartInst) toolChartInst.destroy();
 
       const list = (DATA.tools[currentAccount] || DATA.tools['ALL'] || []).slice(0, 10);
@@ -2904,17 +2979,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const list = DATA.anomalies.filter(a => currentAccount === 'ALL' || a.account === currentAccount);
       const el = document.getElementById('anomaly-container');
       if (!list.length) {
-        el.innerHTML = `<div style="color:#34d399;padding:16px;">✓ No anomalies detected for ${currentAccount}!</div>`;
+        el.innerHTML = `<div style="color:#34d399;padding:16px;">✓ No anomalies detected for ${esc(currentAccount)}!</div>`;
         return;
       }
       el.innerHTML = list.slice(0, 20).map(a => `
-        <div class="anomaly-item ${a.severity}">
+        <div class="anomaly-item ${esc(a.severity)}">
           <div class="anomaly-top">
-            <span><strong>[${a.severity}] ${a.mode}</strong> • ${a.account}</span>
-            <span>Session <code>${a.session_id.slice(0, 10)}</code> • ${a.time_str}</span>
+            <span><strong>[${esc(a.severity)}] ${esc(a.mode)}</strong> • ${esc(a.account)}</span>
+            <span>Session <code>${esc(a.session_id.slice(0, 10))}</code> • ${esc(a.time_str)}</span>
           </div>
-          <div class="anomaly-what">${a.summary}</div>
-          <div class="anomaly-fix">💡 ${a.remediation}</div>
+          <div class="anomaly-what">${esc(a.summary)}</div>
+          <div class="anomaly-fix">💡 ${esc(a.remediation)}</div>
         </div>
       `).join('');
     }
@@ -2942,16 +3017,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               const subPct = s.total_tok > 0 ? ((s.sub_tok / s.total_tok) * 100).toFixed(1) : '0.0';
               return `
                 <tr>
-                  <td><span class="badge badge-active">${s.account}</span></td>
-                  <td><code>${s.session_id.slice(0, 10)}</code></td>
-                  <td>${s.end_time}</td>
+                  <td><span class="badge badge-active">${esc(s.account)}</span></td>
+                  <td><code>${esc(s.session_id.slice(0, 10))}</code></td>
+                  <td>${esc(s.end_time)}</td>
                   <td class="num">${s.turns}</td>
                   <td class="num">${s.subagents}</td>
                   <td class="num">${fmtNum(s.total_tok)}</td>
                   <td class="num">${fmtNum(s.cw_tok)}</td>
                   <td class="num">${subPct}% (${fmtUsd(s.sub_cost)})</td>
                   <td class="num"><strong style="color:#34d399">${fmtUsd(s.total_cost)}</strong></td>
-                  <td style="color:var(--muted);font-size:0.78rem">${s.project.slice(-38)}</td>
+                  <td style="color:var(--muted);font-size:0.78rem">${esc(s.project.slice(-38))}</td>
                 </tr>
               `;
             }).join('')}
@@ -2972,7 +3047,15 @@ def cmd_html(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     out_path = Path(args.output).expanduser() if getattr(args, "output", None) else (HOME / ".claude" / "reports" / "usage_dashboard.html")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    html_str = HTML_TEMPLATE.replace("__REPORT_DATA_JSON__", json.dumps(report_data, ensure_ascii=False))
+    safe_json_payload = (
+        json.dumps(report_data, ensure_ascii=False)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+    html_str = HTML_TEMPLATE.replace("__REPORT_DATA_JSON__", safe_json_payload)
     out_path.write_text(html_str, encoding="utf-8")
 
     print_header("📊 INTERACTIVE HTML ANALYTICS & PREDICTIVE FORECAST EXPORT")
@@ -3011,8 +3094,25 @@ def cmd_html(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
             def __init__(self, *h_args: Any, **h_kwargs: Any) -> None:
                 super().__init__(*h_args, directory=serve_dir, **h_kwargs)
 
+            def _restrict(self) -> bool:
+                req_path = self.path.split("?", 1)[0]
+                if req_path in ("/", f"/{fname}"):
+                    self.path = f"/{fname}"
+                    return True
+                self.send_error(404)
+                return False
+
+            def do_GET(self) -> None:
+                if self._restrict():
+                    super().do_GET()
+
+            def do_HEAD(self) -> None:
+                if self._restrict():
+                    super().do_HEAD()
+
         print(f"\n  {green(f'🌐 Serving live at http://localhost:{port}/{fname} (Press Ctrl+C to stop)')}")
-        with socketserver.TCPServer(("", port), Handler) as httpd:
+        socketserver.TCPServer.allow_reuse_address = True
+        with socketserver.TCPServer(("127.0.0.1", port), Handler) as httpd:
             try:
                 httpd.serve_forever()
             except KeyboardInterrupt:
