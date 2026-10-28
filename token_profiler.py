@@ -1802,6 +1802,1223 @@ def cmd_dashboard(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     cmd_postmortem(conn, args)
 
 
+def build_html_report_data(conn: sqlite3.Connection, days: int = 14) -> Dict[str, Any]:
+    now = time.time()
+    now_dt = dt.datetime.fromtimestamp(now)
+    since_ts = now - days * 86400
+
+    # Discover all accounts present in DB
+    accts_in_db = [
+        r["account"]
+        for r in conn.execute("SELECT DISTINCT account FROM api_requests ORDER BY account").fetchall()
+        if r["account"]
+    ]
+    if not accts_in_db:
+        accts_in_db = sorted(ACCOUNT_DIRS.keys())
+
+    # 1. Daily time-series per account for the last `days` days
+    start_day_dt = (now_dt - dt.timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    day_labels: List[str] = []
+    for i in range(days):
+        d = start_day_dt + dt.timedelta(days=i)
+        day_labels.append(d.strftime("%Y-%m-%d"))
+
+    daily_rows = conn.execute(
+        """
+        SELECT
+            account,
+            strftime('%Y-%m-%d', timestamp, 'unixepoch', 'localtime') AS day_str,
+            SUM(input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens) AS total_tok,
+            SUM(input_tokens + output_tokens + cache_creation_tokens) AS fresh_tok,
+            SUM(cache_creation_tokens) AS cw_tok,
+            SUM(CASE WHEN is_subagent = 1 THEN (input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens) ELSE 0 END) AS sub_tok,
+            SUM(cost_usd) AS cost_usd,
+            COUNT(*) AS turns
+        FROM api_requests
+        WHERE timestamp >= ?
+        GROUP BY account, day_str
+        ORDER BY day_str ASC
+        """,
+        (start_day_dt.timestamp(),),
+    ).fetchall()
+
+    daily_by_acct: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(
+        lambda: defaultdict(lambda: {"total_tok": 0.0, "fresh_tok": 0.0, "cw_tok": 0.0, "sub_tok": 0.0, "cost_usd": 0.0, "turns": 0.0})
+    )
+    for r in daily_rows:
+        d_str = r["day_str"]
+        if not d_str:
+            continue
+        acct = r["account"]
+        for k in ("total_tok", "fresh_tok", "cw_tok", "sub_tok", "cost_usd", "turns"):
+            val = float(r[k] or 0.0)
+            daily_by_acct[acct][d_str][k] += val
+            daily_by_acct["ALL"][d_str][k] += val
+
+    # 2. Predictive Forecasting Engine (7-Day Forward Forecast using Weighted EMA + Linear Trend)
+    forecast_days = 7
+    future_labels: List[str] = [
+        (now_dt + dt.timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, forecast_days + 1)
+    ]
+
+    forecasts_by_acct: Dict[str, Dict[str, Any]] = {}
+    for acct_key in ["ALL"] + accts_in_db:
+        cost_series = [daily_by_acct[acct_key][d]["cost_usd"] for d in day_labels]
+        tok_series = [daily_by_acct[acct_key][d]["total_tok"] for d in day_labels]
+        fresh_series = [daily_by_acct[acct_key][d]["fresh_tok"] for d in day_labels]
+
+        def project_series(series: List[float]) -> Tuple[List[float], List[float], List[float], float, float]:
+            n = len(series)
+            if n == 0 or sum(series) == 0:
+                zeros = [0.0] * forecast_days
+                return zeros, zeros, zeros, 0.0, 0.0
+            # Compute Exponential Moving Average (alpha = 0.35)
+            alpha = 0.35
+            ema = series[0]
+            for val in series[1:]:
+                ema = alpha * val + (1.0 - alpha) * ema
+            # Compute linear regression slope over the last min(n, 10) days
+            w = min(n, 10)
+            sub = series[-w:]
+            x_mean = (w - 1) / 2.0
+            y_mean = sum(sub) / w
+            num = sum((i - x_mean) * (sub[i] - y_mean) for i in range(w))
+            den = sum((i - x_mean) ** 2 for i in range(w)) or 1.0
+            slope = num / den
+            # Standard deviation of active days for upper/lower confidence bands
+            variance = sum((v - y_mean) ** 2 for v in sub) / max(1, w)
+            std_dev = variance ** 0.5
+
+            expected: List[float] = []
+            high_band: List[float] = []
+            low_band: List[float] = []
+            for step in range(1, forecast_days + 1):
+                # Damped trend blended with EMA
+                pred = max(0.0, 0.65 * ema + 0.35 * y_mean + slope * step * 0.4)
+                expected.append(round(pred, 2))
+                high_band.append(round(pred + 0.75 * std_dev, 2))
+                low_band.append(round(max(0.0, pred - 0.5 * std_dev), 2))
+            proj_7d = sum(expected)
+            proj_30d = proj_7d * (30.0 / 7.0)
+            return expected, low_band, high_band, proj_7d, proj_30d
+
+        c_exp, c_low, c_high, c_7d, c_30d = project_series(cost_series)
+        t_exp, t_low, t_high, t_7d, t_30d = project_series(tok_series)
+        f_exp, _, _, f_7d, f_30d = project_series(fresh_series)
+
+        forecasts_by_acct[acct_key] = {
+            "cost_expected": c_exp,
+            "cost_low": c_low,
+            "cost_high": c_high,
+            "cost_7d": round(c_7d, 2),
+            "cost_30d": round(c_30d, 2),
+            "tok_expected": t_exp,
+            "tok_low": t_low,
+            "tok_high": t_high,
+            "tok_7d": round(t_7d, 0),
+            "tok_30d": round(t_30d, 0),
+            "fresh_expected": f_exp,
+            "fresh_7d": round(f_7d, 0),
+            "fresh_30d": round(f_30d, 0),
+        }
+
+    # 3. 5-Hour Rolling Window & P90 Empirical Quota Exhaustion Prediction
+    # Group historical requests into 5-hour buckets over the last 30 days to find empirical P90 & Max 5h block ceiling per account
+    hist_5h_rows = conn.execute(
+        """
+        SELECT
+            account,
+            CAST(timestamp / 18000 AS INTEGER) AS bucket_5h,
+            SUM(input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens) AS total_tok,
+            SUM(input_tokens + output_tokens + cache_creation_tokens) AS fresh_tok,
+            SUM(cost_usd) AS cost_usd
+        FROM api_requests
+        WHERE timestamp >= ?
+        GROUP BY account, bucket_5h
+        """,
+        (now - 30 * 86400,),
+    ).fetchall()
+
+    buckets_by_acct: Dict[str, List[Dict[str, float]]] = defaultdict(list)
+    combined_5h_buckets: Dict[int, Dict[str, float]] = defaultdict(lambda: {"total_tok": 0.0, "fresh_tok": 0.0, "cost_usd": 0.0})
+    for r in hist_5h_rows:
+        entry = {"total_tok": float(r["total_tok"] or 0), "fresh_tok": float(r["fresh_tok"] or 0), "cost_usd": float(r["cost_usd"] or 0)}
+        buckets_by_acct[r["account"]].append(entry)
+        b_id = int(r["bucket_5h"] or 0)
+        combined_5h_buckets[b_id]["total_tok"] += entry["total_tok"]
+        combined_5h_buckets[b_id]["fresh_tok"] += entry["fresh_tok"]
+        combined_5h_buckets[b_id]["cost_usd"] += entry["cost_usd"]
+    buckets_by_acct["ALL"] = list(combined_5h_buckets.values())
+
+    def percentile(vals: List[float], q: float, default_val: float) -> float:
+        if not vals:
+            return default_val
+        s = sorted(vals)
+        idx = min(len(s) - 1, max(0, int(round(q * (len(s) - 1)))))
+        return max(s[idx], default_val)
+
+    burn_5h = compute_active_burn_rate(conn, now - 5 * 3600)
+    burn_1h = compute_active_burn_rate(conn, now - 3600)
+    burn_window = compute_active_burn_rate(conn, since_ts)
+
+    quota_predictions: Dict[str, Dict[str, Any]] = {}
+    for acct_key in ["ALL"] + accts_in_db:
+        b_list = buckets_by_acct.get(acct_key, [])
+        p90_cost = percentile([x["cost_usd"] for x in b_list], 0.90, 45.0)
+        max_cost = percentile([x["cost_usd"] for x in b_list], 1.00, 60.0)
+        p90_tok = percentile([x["total_tok"] for x in b_list], 0.90, 80_000_000.0)
+
+        if acct_key == "ALL":
+            cur_5h_cost = sum(v["cost_usd"] for v in burn_5h.values())
+            cur_5h_tok = sum(v["total_tok"] for v in burn_5h.values())
+            cur_5h_fresh = sum(v["fresh_tok"] for v in burn_5h.values())
+            cur_5h_sec = sum(v["active_sec"] for v in burn_5h.values())
+            cur_1h_cost = sum(v["cost_usd"] for v in burn_1h.values())
+            cur_1h_tok = sum(v["total_tok"] for v in burn_1h.values())
+            cur_1h_sec = sum(v["active_sec"] for v in burn_1h.values())
+        else:
+            s5 = burn_5h.get(acct_key, {"cost_usd": 0.0, "total_tok": 0.0, "fresh_tok": 0.0, "active_sec": 0.0})
+            s1 = burn_1h.get(acct_key, {"cost_usd": 0.0, "total_tok": 0.0, "active_sec": 0.0})
+            cur_5h_cost = s5["cost_usd"]
+            cur_5h_tok = s5["total_tok"]
+            cur_5h_fresh = s5["fresh_tok"]
+            cur_5h_sec = s5["active_sec"]
+            cur_1h_cost = s1["cost_usd"]
+            cur_1h_tok = s1["total_tok"]
+            cur_1h_sec = s1["active_sec"]
+
+        active_min_5h = max(0.25, cur_5h_sec / 60.0) if cur_5h_sec > 0 else 0.0
+        tok_per_min = (cur_5h_tok / active_min_5h) if active_min_5h > 0 else 0.0
+        usd_per_hr = (cur_5h_cost / (active_min_5h / 60.0)) if active_min_5h > 0 else 0.0
+
+        fill_pct = min(100.0, 100.0 * cur_5h_cost / max(1.0, p90_cost))
+        rem_cost = max(0.0, p90_cost - cur_5h_cost)
+        if cur_1h_cost > 0.25 and usd_per_hr > 0.5:
+            hrs_left = rem_cost / usd_per_hr
+            if hrs_left <= 0.05:
+                eta_str = "Near/At P90 Cap!"
+                status_level = "critical"
+            elif hrs_left < 5.0:
+                h = int(hrs_left)
+                m = int((hrs_left - h) * 60)
+                eta_str = f"~{h}h {m:02d}m to P90 cap" if h > 0 else f"~{m}m to P90 cap"
+                status_level = "warning" if hrs_left < 2.0 else "active"
+            else:
+                eta_str = ">5h headroom (Safe)"
+                status_level = "safe"
+        else:
+            eta_str = "Idle / Safe"
+            status_level = "safe"
+
+        quota_predictions[acct_key] = {
+            "cur_5h_cost": round(cur_5h_cost, 2),
+            "cur_5h_tok": round(cur_5h_tok, 0),
+            "cur_5h_fresh": round(cur_5h_fresh, 0),
+            "p90_5h_cost": round(p90_cost, 2),
+            "max_5h_cost": round(max_cost, 2),
+            "p90_5h_tok": round(p90_tok, 0),
+            "tok_per_min": round(tok_per_min, 0),
+            "usd_per_hr": round(usd_per_hr, 2),
+            "fill_pct": round(fill_pct, 1),
+            "eta_str": eta_str,
+            "status_level": status_level,
+        }
+
+    # 4. Hourly Velocity over Last 48 Hours
+    h48_start = (now_dt - dt.timedelta(hours=47)).replace(minute=0, second=0, microsecond=0)
+    hour_labels: List[str] = [
+        (h48_start + dt.timedelta(hours=i)).strftime("%m-%d %H:00") for i in range(48)
+    ]
+    h48_rows = conn.execute(
+        """
+        SELECT
+            account,
+            strftime('%m-%d %H:00', timestamp, 'unixepoch', 'localtime') AS hr_str,
+            SUM(input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens) AS total_tok,
+            SUM(cost_usd) AS cost_usd
+        FROM api_requests
+        WHERE timestamp >= ?
+        GROUP BY account, hr_str
+        """,
+        (h48_start.timestamp(),),
+    ).fetchall()
+    hourly_by_acct: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(
+        lambda: defaultdict(lambda: {"total_tok": 0.0, "cost_usd": 0.0})
+    )
+    for r in h48_rows:
+        hs = r["hr_str"]
+        if not hs:
+            continue
+        hourly_by_acct[r["account"]][hs]["total_tok"] += float(r["total_tok"] or 0.0)
+        hourly_by_acct[r["account"]][hs]["cost_usd"] += float(r["cost_usd"] or 0.0)
+        hourly_by_acct["ALL"][hs]["total_tok"] += float(r["total_tok"] or 0.0)
+        hourly_by_acct["ALL"][hs]["cost_usd"] += float(r["cost_usd"] or 0.0)
+
+    # 5. Actors & Subagents Breakdown
+    actor_rows = conn.execute(
+        """
+        SELECT
+            account,
+            CASE WHEN is_subagent = 1 THEN 'Subagent: ' || COALESCE(agent_type, 'general') ELSE 'Main Session Agent' END AS actor,
+            COUNT(*) AS turns,
+            SUM(input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens) AS total_tok,
+            SUM(cache_creation_tokens) AS cw_tok,
+            SUM(output_tokens) AS out_tok,
+            SUM(thinking_tokens) AS think_tok,
+            SUM(cost_usd) AS cost_usd
+        FROM api_requests
+        WHERE timestamp >= ?
+        GROUP BY account, actor
+        ORDER BY cost_usd DESC
+        """,
+        (since_ts,),
+    ).fetchall()
+
+    actors_by_acct: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    actors_all_agg: Dict[str, Dict[str, Any]] = {}
+    for r in actor_rows:
+        item = {
+            "actor": r["actor"],
+            "turns": int(r["turns"] or 0),
+            "total_tok": float(r["total_tok"] or 0),
+            "cw_tok": float(r["cw_tok"] or 0),
+            "out_tok": float(r["out_tok"] or 0),
+            "think_tok": float(r["think_tok"] or 0),
+            "cost_usd": round(float(r["cost_usd"] or 0.0), 2),
+        }
+        actors_by_acct[r["account"]].append(item)
+        if r["actor"] not in actors_all_agg:
+            actors_all_agg[r["actor"]] = dict(item)
+        else:
+            for k in ("turns", "total_tok", "cw_tok", "out_tok", "think_tok", "cost_usd"):
+                actors_all_agg[r["actor"]][k] = round(actors_all_agg[r["actor"]][k] + item[k], 2)
+    actors_by_acct["ALL"] = sorted(actors_all_agg.values(), key=lambda x: -x["cost_usd"])
+
+    # 6. Top MCP Servers & Tools Attribution
+    tool_rows = conn.execute(
+        """
+        SELECT
+            account,
+            actor_category,
+            tool_name,
+            mcp_server,
+            mcp_tool,
+            COUNT(*) AS calls,
+            SUM(is_error) AS errors,
+            SUM(est_result_tokens) AS payload_tok,
+            SUM(induced_cache_write_tokens) AS induced_cw,
+            AVG(duration_sec) AS avg_sec
+        FROM tool_invocations
+        WHERE timestamp >= ?
+        GROUP BY account, actor_category, tool_name
+        ORDER BY induced_cw DESC, payload_tok DESC
+        """,
+        (since_ts,),
+    ).fetchall()
+
+    tools_by_acct: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    tools_all_agg: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for r in tool_rows:
+        label = f"mcp:{r['mcp_server']}/{r['mcp_tool']}" if r["mcp_server"] else r["tool_name"]
+        item = {
+            "label": label[:36],
+            "category": r["actor_category"],
+            "is_mcp": bool(r["mcp_server"]),
+            "calls": int(r["calls"] or 0),
+            "errors": int(r["errors"] or 0),
+            "payload_tok": int(r["payload_tok"] or 0),
+            "induced_cw": int(r["induced_cw"] or 0),
+            "avg_sec": round(float(r["avg_sec"] or 0.0), 1),
+        }
+        tools_by_acct[r["account"]].append(item)
+        key = (r["actor_category"], label[:36])
+        if key not in tools_all_agg:
+            tools_all_agg[key] = dict(item)
+        else:
+            for k in ("calls", "errors", "payload_tok", "induced_cw"):
+                tools_all_agg[key][k] += item[k]
+    tools_by_acct["ALL"] = sorted(tools_all_agg.values(), key=lambda x: -(x["induced_cw"] + x["payload_tok"]))[:25]
+    for acct in accts_in_db:
+        tools_by_acct[acct] = sorted(tools_by_acct[acct], key=lambda x: -(x["induced_cw"] + x["payload_tok"]))[:25]
+
+    # 7. Week-over-Week (Rolling 7d vs Previous 7d)
+    r7_start = now - 7 * 86400
+    prev7_start = now - 14 * 86400
+    cur_wow = get_period_metrics(conn, r7_start, now)
+    prv_wow = get_period_metrics(conn, prev7_start, r7_start)
+
+    # 8. Top Sessions & Post-Mortem Anomalies
+    sess_rows = conn.execute(
+        """
+        SELECT account, session_id, project_slug, start_ts, end_ts, turn_count, subagent_count,
+               (input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens) AS total_tok,
+               cache_creation_tokens, cache_read_tokens, output_tokens, subagent_total_tokens,
+               subagent_cost_usd, total_cost_usd
+        FROM sessions
+        WHERE end_ts >= ? AND turn_count >= 1
+        ORDER BY total_cost_usd DESC
+        LIMIT 40
+        """,
+        (since_ts,),
+    ).fetchall()
+    top_sessions = [
+        {
+            "account": r["account"],
+            "session_id": r["session_id"],
+            "project": r["project_slug"] or "",
+            "end_time": dt.datetime.fromtimestamp(r["end_ts"]).strftime("%Y-%m-%d %H:%M"),
+            "turns": int(r["turn_count"] or 0),
+            "subagents": int(r["subagent_count"] or 0),
+            "total_tok": int(r["total_tok"] or 0),
+            "cw_tok": int(r["cache_creation_tokens"] or 0),
+            "sub_tok": int(r["subagent_total_tokens"] or 0),
+            "sub_cost": round(float(r["subagent_cost_usd"] or 0.0), 2),
+            "total_cost": round(float(r["total_cost_usd"] or 0.0), 2),
+        }
+        for r in sess_rows
+    ]
+
+    raw_anomalies = analyze_postmortem_anomalies(conn, since_ts)
+    anomalies_list = [
+        {
+            "mode": a["mode"],
+            "severity": a["severity"],
+            "account": a["account"],
+            "session_id": a["session_id"],
+            "time_str": dt.datetime.fromtimestamp(a["timestamp"]).strftime("%Y-%m-%d %H:%M") if a["timestamp"] else "-",
+            "summary": a["summary"],
+            "remediation": a["remediation"],
+        }
+        for a in raw_anomalies[:50]
+    ]
+
+    # Serialize daily & hourly series cleanly
+    daily_serialized: Dict[str, Dict[str, List[float]]] = {}
+    for acct_key in ["ALL"] + accts_in_db:
+        daily_serialized[acct_key] = {
+            "cost_usd": [round(daily_by_acct[acct_key][d]["cost_usd"], 2) for d in day_labels],
+            "total_tok": [round(daily_by_acct[acct_key][d]["total_tok"], 0) for d in day_labels],
+            "fresh_tok": [round(daily_by_acct[acct_key][d]["fresh_tok"], 0) for d in day_labels],
+            "sub_tok": [round(daily_by_acct[acct_key][d]["sub_tok"], 0) for d in day_labels],
+            "turns": [int(daily_by_acct[acct_key][d]["turns"]) for d in day_labels],
+        }
+
+    hourly_serialized: Dict[str, Dict[str, List[float]]] = {}
+    for acct_key in ["ALL"] + accts_in_db:
+        hourly_serialized[acct_key] = {
+            "cost_usd": [round(hourly_by_acct[acct_key][h]["cost_usd"], 2) for h in hour_labels],
+            "total_tok": [round(hourly_by_acct[acct_key][h]["total_tok"], 0) for h in hour_labels],
+        }
+
+    return {
+        "generated_at": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "days": days,
+        "accounts": accts_in_db,
+        "day_labels": day_labels,
+        "future_labels": future_labels,
+        "daily": daily_serialized,
+        "forecasts": forecasts_by_acct,
+        "quota_predictions": quota_predictions,
+        "hour_labels": hour_labels,
+        "hourly": hourly_serialized,
+        "actors": dict(actors_by_acct),
+        "tools": dict(tools_by_acct),
+        "wow_curr": cur_wow,
+        "wow_prev": prv_wow,
+        "top_sessions": top_sessions,
+        "anomalies": anomalies_list,
+    }
+
+
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Claude Code Token Profiler — Analytics & Predictive Forecast</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg: #0b0f17;
+      --card: #131b2e;
+      --card-border: #1e293b;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --purple: #a855f7;
+      --emerald: #10b981;
+      --amber: #f59e0b;
+      --rose: #f43f5e;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+      line-height: 1.5;
+      padding: 24px 32px 64px;
+    }
+    .container { max-width: 1480px; margin: 0 auto; }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      padding-bottom: 20px;
+      border-bottom: 1px solid var(--card-border);
+      margin-bottom: 24px;
+    }
+    .title-group h1 {
+      font-size: 1.55rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      background: linear-gradient(90deg, #38bdf8, #a855f7, #ec4899);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .title-group p { color: var(--muted); font-size: 0.85rem; margin-top: 4px; }
+    .tabs {
+      display: flex;
+      gap: 8px;
+      background: #0f172a;
+      padding: 5px;
+      border-radius: 10px;
+      border: 1px solid var(--card-border);
+    }
+    .tab-btn {
+      background: transparent;
+      color: var(--muted);
+      border: none;
+      padding: 8px 16px;
+      border-radius: 7px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .tab-btn:hover { color: var(--text); }
+    .tab-btn.active {
+      background: linear-gradient(135deg, #0284c7, #6366f1);
+      color: #fff;
+      box-shadow: 0 2px 10px rgba(56, 189, 248, 0.25);
+    }
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 18px 20px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+    }
+    .kpi-label { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 600; }
+    .kpi-val { font-size: 1.75rem; font-weight: 700; margin: 6px 0 4px; color: #f8fafc; }
+    .kpi-sub { font-size: 0.82rem; color: var(--muted); display: flex; justify-content: space-between; align-items: center; }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.74rem;
+      font-weight: 600;
+    }
+    .badge-safe { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }
+    .badge-active { background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); }
+    .badge-warning { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3); }
+    .badge-critical { background: rgba(244, 63, 94, 0.18); color: #fb7185; border: 1px solid rgba(244, 63, 94, 0.35); }
+    .progress-bar {
+      width: 100%;
+      height: 8px;
+      background: #0f172a;
+      border-radius: 999px;
+      overflow: hidden;
+      margin-top: 10px;
+      border: 1px solid #1e293b;
+    }
+    .progress-fill {
+      height: 100%;
+      border-radius: 999px;
+      transition: width 0.4s ease;
+    }
+    .charts-grid-2 {
+      display: grid;
+      grid-template-columns: 1.6fr 1fr;
+      gap: 18px;
+      margin-bottom: 20px;
+    }
+    .charts-grid-equal {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+      margin-bottom: 24px;
+    }
+    @media (max-width: 1080px) {
+      .charts-grid-2, .charts-grid-equal { grid-template-columns: 1fr; }
+    }
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 14px;
+    }
+    .card-title { font-size: 1rem; font-weight: 600; color: #f1f5f9; }
+    .card-subtitle { font-size: 0.78rem; color: var(--muted); }
+    .chart-box { position: relative; height: 320px; width: 100%; }
+    .metric-switch {
+      display: flex;
+      gap: 6px;
+      background: #0f172a;
+      padding: 3px;
+      border-radius: 7px;
+      border: 1px solid var(--card-border);
+    }
+    .metric-btn {
+      background: transparent;
+      color: var(--muted);
+      border: none;
+      padding: 4px 10px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      border-radius: 5px;
+      cursor: pointer;
+    }
+    .metric-btn.active { background: #1e293b; color: #38bdf8; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
+    th, td {
+      padding: 10px 12px;
+      text-align: left;
+      border-bottom: 1px solid #1e293b;
+    }
+    th {
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      background: rgba(15, 23, 42, 0.5);
+    }
+    tr:hover td { background: rgba(30, 41, 59, 0.35); }
+    .num { text-align: right; font-variant-numeric: tabular-nums; }
+    .up-bad { color: #fb7185; font-weight: 600; }
+    .down-good { color: #34d399; font-weight: 600; }
+    .anomaly-list { display: flex; flex-direction: column; gap: 10px; max-height: 480px; overflow-y: auto; padding-right: 4px; }
+    .anomaly-item {
+      background: #0f172a;
+      border: 1px solid #1e293b;
+      border-left: 4px solid #f43f5e;
+      border-radius: 8px;
+      padding: 12px 14px;
+    }
+    .anomaly-item.MED { border-left-color: #f59e0b; }
+    .anomaly-item.LOW { border-left-color: #38bdf8; }
+    .anomaly-top { display: flex; justify-content: space-between; font-size: 0.8rem; margin-bottom: 4px; color: var(--muted); }
+    .anomaly-what { font-size: 0.88rem; font-weight: 600; color: #f1f5f9; margin-bottom: 4px; }
+    .anomaly-fix { font-size: 0.8rem; color: #94a3b8; }
+    code { background: #1e293b; padding: 2px 6px; border-radius: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; color: #38bdf8; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="title-group">
+        <h1>⚡ Claude Code Multi-Account Token Profiler & Forecast</h1>
+        <p id="report-meta">Generated: —</p>
+      </div>
+      <div class="tabs" id="account-tabs"></div>
+    </header>
+
+    <!-- Predictive & Burn Rate KPI Cards -->
+    <div class="kpi-grid" id="kpi-container"></div>
+
+    <!-- Row 1: Daily Usage + 7-Day Forecast & 48h Rolling Burn Trajectory -->
+    <div class="charts-grid-2">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">📈 Daily Consumption & 7-Day Predictive Forecast (EMA + Trend)</div>
+            <div class="card-subtitle">Solid bars = Historical daily usage | Dashed line & shaded band = Next 7 days forecast</div>
+          </div>
+          <div class="metric-switch">
+            <button class="metric-btn active" onclick="setForecastMetric('cost_usd', this)">Cost ($)</button>
+            <button class="metric-btn" onclick="setForecastMetric('total_tok', this)">Total Tokens</button>
+            <button class="metric-btn" onclick="setForecastMetric('fresh_tok', this)">Fresh CacheWrite</button>
+          </div>
+        </div>
+        <div class="chart-box"><canvas id="forecastChart"></canvas></div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">🔥 Last 48 Hours Burn Velocity</div>
+            <div class="card-subtitle">Hourly token & cost spikes across active sessions</div>
+          </div>
+        </div>
+        <div class="chart-box"><canvas id="hourlyChart"></canvas></div>
+      </div>
+    </div>
+
+    <!-- Row 2: Who Uses Tokens (Actors/Subagents) & Top MCP/Tool Attribution -->
+    <div class="charts-grid-equal">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">🕵️ Who Uses Tokens: Main Agent vs. Subagent Types</div>
+            <div class="card-subtitle">Share of API-equivalent cost by execution context</div>
+          </div>
+        </div>
+        <div class="chart-box"><canvas id="actorChart"></canvas></div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">🔌 Top MCP Servers & Tools Token Attribution</div>
+            <div class="card-subtitle">Direct Payload Tokens Injected vs. Induced Prompt-Cache Writes</div>
+          </div>
+        </div>
+        <div class="chart-box"><canvas id="toolChart"></canvas></div>
+      </div>
+    </div>
+
+    <!-- Row 3: Week-over-Week Comparison & 5-Mode Post-Mortem Diagnostics -->
+    <div class="charts-grid-equal">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">📊 Week-over-Week (Rolling 7d vs. Previous 7d)</div>
+            <div class="card-subtitle">Normalized 7-day window comparison</div>
+          </div>
+        </div>
+        <div id="wow-table-wrap"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">🔬 Automated "What Went Wrong" Post-Mortem Incidents</div>
+            <div class="card-subtitle">5 failure modes: MCP bloat, 5m TTL cold-cache busts, Opus subagent amplification, retry loops & AFK stalls</div>
+          </div>
+        </div>
+        <div class="anomaly-list" id="anomaly-container"></div>
+      </div>
+    </div>
+
+    <!-- Row 4: Top Highest-Burn Sessions Table -->
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <div class="card-title">🏆 Top Highest-Burn Sessions</div>
+          <div class="card-subtitle">Tip: Run <code>claude-profiler postmortem &lt;session_id&gt;</code> in your terminal for turn-by-turn & subagent tables</div>
+        </div>
+      </div>
+      <div style="overflow-x:auto" id="sessions-table-wrap"></div>
+    </div>
+  </div>
+
+  <script>
+    const DATA = __REPORT_DATA_JSON__;
+    let currentAccount = 'ALL';
+    let currentMetric = 'cost_usd';
+    let forecastChartInst = null;
+    let hourlyChartInst = null;
+    let actorChartInst = null;
+    let toolChartInst = null;
+
+    const ACCT_COLORS = {
+      'claude-work': '#38bdf8',
+      'claude-dev': '#a855f7',
+      'claude-personal': '#10b981',
+      'claude-default': '#f59e0b'
+    };
+
+    function fmtNum(n) {
+      if (n == null || isNaN(n)) return '0';
+      const abs = Math.abs(n);
+      if (abs >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+      if (abs >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+      if (abs >= 1e4) return (n / 1e3).toFixed(1) + 'k';
+      if (abs >= 1e3) return Math.round(n).toLocaleString();
+      return Number.isInteger(n) ? String(n) : n.toFixed(1);
+    }
+
+    function fmtUsd(n) {
+      if (n == null || isNaN(n)) return '$0.00';
+      return '$' + Number(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+
+    function init() {
+      document.getElementById('report-meta').textContent =
+        `Generated: ${DATA.generated_at} • Lookback: Last ${DATA.days} Days • Accounts: ${DATA.accounts.join(', ')}`;
+
+      const tabsEl = document.getElementById('account-tabs');
+      const allTabs = ['ALL', ...DATA.accounts];
+      tabsEl.innerHTML = allTabs.map(acct => `
+        <button class="tab-btn ${acct === currentAccount ? 'active' : ''}" onclick="selectAccount('${acct}', this)">
+          ${acct === 'ALL' ? 'All Accounts' : acct}
+        </button>
+      `).join('');
+
+      renderAll();
+    }
+
+    function selectAccount(acct, btnEl) {
+      currentAccount = acct;
+      document.querySelectorAll('#account-tabs .tab-btn').forEach(b => b.classList.remove('active'));
+      btnEl.classList.add('active');
+      renderAll();
+    }
+
+    function setForecastMetric(metric, btnEl) {
+      currentMetric = metric;
+      document.querySelectorAll('.metric-switch .metric-btn').forEach(b => b.classList.remove('active'));
+      btnEl.classList.add('active');
+      renderForecastChart();
+    }
+
+    function renderAll() {
+      renderKPIs();
+      renderForecastChart();
+      renderHourlyChart();
+      renderActorChart();
+      renderToolChart();
+      renderWoWTable();
+      renderAnomalies();
+      renderSessionsTable();
+    }
+
+    function renderKPIs() {
+      const q = DATA.quota_predictions[currentAccount] || DATA.quota_predictions['ALL'];
+      const f = DATA.forecasts[currentAccount] || DATA.forecasts['ALL'];
+      const wowKey = currentAccount === 'ALL' ? 'ALL ACCOUNTS' : currentAccount;
+      const curW = (DATA.wow_curr && DATA.wow_curr[wowKey]) || {};
+      const prvW = (DATA.wow_prev && DATA.wow_prev[wowKey]) || {};
+
+      const badgeClass = `badge badge-${q.status_level || 'safe'}`;
+      const barColor = q.fill_pct >= 85 ? '#f43f5e' : (q.fill_pct >= 60 ? '#f59e0b' : '#38bdf8');
+
+      const cur7Cost = curW.cost_usd || 0;
+      const prv7Cost = prvW.cost_usd || 0;
+      const wowPct = prv7Cost > 0 ? (((cur7Cost - prv7Cost) / prv7Cost) * 100).toFixed(1) : '0.0';
+
+      document.getElementById('kpi-container').innerHTML = `
+        <div class="card">
+          <div class="kpi-label">⏱️ Rolling 5h Window & Exhaustion ETA</div>
+          <div class="kpi-val">${fmtUsd(q.cur_5h_cost)} <span style="font-size:0.95rem;color:var(--muted);font-weight:500">/ ${fmtUsd(q.p90_5h_cost)} P90</span></div>
+          <div class="kpi-sub">
+            <span>${fmtNum(q.cur_5h_tok)} tok (${fmtNum(q.cur_5h_fresh)} write)</span>
+            <span class="${badgeClass}">${q.eta_str}</span>
+          </div>
+          <div class="progress-bar">
+            <div class="progress-fill" style="width:${Math.min(100, q.fill_pct)}%;background:${barColor}"></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="kpi-label">🔥 Live Active Burn Velocity</div>
+          <div class="kpi-val">${fmtNum(q.tok_per_min)} <span style="font-size:1rem;color:var(--muted)">tok/min</span></div>
+          <div class="kpi-sub">
+            <span>Cost Velocity: <strong style="color:#38bdf8">${fmtUsd(q.usd_per_hr)}/hr</strong></span>
+            <span>5h Fill: <strong>${q.fill_pct}%</strong></span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="kpi-label">🔮 Next 7-Day Predictive Forecast</div>
+          <div class="kpi-val">${fmtUsd(f.cost_7d)}</div>
+          <div class="kpi-sub">
+            <span>Projected Tokens: <strong>${fmtNum(f.tok_7d)}</strong></span>
+            <span>Fresh Write: <strong>${fmtNum(f.fresh_7d)}</strong></span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="kpi-label">📅 30-Day Run-Rate Projection</div>
+          <div class="kpi-val">${fmtUsd(f.cost_30d)}</div>
+          <div class="kpi-sub">
+            <span>30d Tokens: <strong>${fmtNum(f.tok_30d)}</strong></span>
+            <span>7d WoW Trend: <strong class="${Number(wowPct) > 0 ? 'up-bad' : 'down-good'}">${Number(wowPct) > 0 ? '+' : ''}${wowPct}%</strong></span>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderForecastChart() {
+      const ctx = document.getElementById('forecastChart').getContext('2d');
+      if (forecastChartInst) forecastChartInst.destroy();
+
+      const histLabels = DATA.day_labels.map(d => d.slice(5));
+      const futLabels = DATA.future_labels.map(d => d.slice(5) + ' (proj)');
+      const allLabels = [...histLabels, ...futLabels];
+      const histLen = histLabels.length;
+      const futLen = futLabels.length;
+
+      const fData = DATA.forecasts[currentAccount] || DATA.forecasts['ALL'];
+      const expKey = currentMetric === 'cost_usd' ? 'cost_expected' : (currentMetric === 'total_tok' ? 'tok_expected' : 'fresh_expected');
+      const highKey = currentMetric === 'cost_usd' ? 'cost_high' : 'tok_high';
+      const lowKey = currentMetric === 'cost_usd' ? 'cost_low' : 'tok_low';
+
+      const datasets = [];
+      if (currentAccount === 'ALL') {
+        DATA.accounts.forEach(acct => {
+          const s = (DATA.daily[acct] && DATA.daily[acct][currentMetric]) || [];
+          datasets.push({
+            type: 'bar',
+            label: acct,
+            data: [...s, ...Array(futLen).fill(null)],
+            backgroundColor: ACCT_COLORS[acct] || '#38bdf8',
+            stack: 'hist',
+            borderRadius: 4
+          });
+        });
+      } else {
+        const s = (DATA.daily[currentAccount] && DATA.daily[currentAccount][currentMetric]) || [];
+        datasets.push({
+          type: 'bar',
+          label: currentAccount,
+          data: [...s, ...Array(futLen).fill(null)],
+          backgroundColor: ACCT_COLORS[currentAccount] || '#38bdf8',
+          borderRadius: 4
+        });
+      }
+
+      const totHist = (DATA.daily[currentAccount] && DATA.daily[currentAccount][currentMetric]) || [];
+      const lastActual = totHist.length ? totHist[totHist.length - 1] : 0;
+      const forecastLine = [...Array(Math.max(0, histLen - 1)).fill(null), lastActual, ...(fData[expKey] || [])];
+
+      datasets.push({
+        type: 'line',
+        label: '7-Day Forecast (EMA + Trend)',
+        data: forecastLine,
+        borderColor: '#f59e0b',
+        backgroundColor: 'rgba(245, 158, 11, 0.15)',
+        borderDash: [6, 4],
+        borderWidth: 2.5,
+        pointRadius: 3,
+        tension: 0.25
+      });
+
+      if (currentMetric !== 'fresh_tok' && fData[highKey]) {
+        const highLine = [...Array(Math.max(0, histLen - 1)).fill(null), lastActual, ...fData[highKey]];
+        datasets.push({
+          type: 'line',
+          label: 'High-Burst Band (+0.75σ)',
+          data: highLine,
+          borderColor: 'rgba(244, 63, 94, 0.45)',
+          borderDash: [3, 3],
+          borderWidth: 1.5,
+          pointRadius: 0,
+          fill: false,
+          tension: 0.25
+        });
+      }
+
+      forecastChartInst = new Chart(ctx, {
+        data: { labels: allLabels, datasets },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: 'index', intersect: false },
+          plugins: {
+            legend: { labels: { color: '#cbd5e1', font: { size: 11 } } },
+            tooltip: {
+              callbacks: {
+                label: (c) => `${c.dataset.label}: ${currentMetric === 'cost_usd' ? fmtUsd(c.raw) : fmtNum(c.raw)}`
+              }
+            }
+          },
+          scales: {
+            x: { stacked: true, ticks: { color: '#94a3b8', font: { size: 11 } }, grid: { color: '#1e293b' } },
+            y: {
+              stacked: true,
+              ticks: {
+                color: '#94a3b8',
+                callback: (v) => currentMetric === 'cost_usd' ? '$' + v : fmtNum(v)
+              },
+              grid: { color: '#1e293b' }
+            }
+          }
+        }
+      });
+    }
+
+    function renderHourlyChart() {
+      const ctx = document.getElementById('hourlyChart').getContext('2d');
+      if (hourlyChartInst) hourlyChartInst.destroy();
+
+      const hData = DATA.hourly[currentAccount] || DATA.hourly['ALL'];
+      hourlyChartInst = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: DATA.hour_labels.map(h => h.slice(6)),
+          datasets: [
+            {
+              label: 'Hourly Cost ($)',
+              data: hData ? hData.cost_usd : [],
+              borderColor: '#38bdf8',
+              backgroundColor: 'rgba(56, 189, 248, 0.15)',
+              fill: true,
+              tension: 0.3,
+              pointRadius: 2
+            }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { labels: { color: '#cbd5e1' } },
+            tooltip: { callbacks: { label: (c) => `Hourly Burn: ${fmtUsd(c.raw)}` } }
+          },
+          scales: {
+            x: { ticks: { color: '#94a3b8', maxTicksLimit: 8 }, grid: { color: '#1e293b' } },
+            y: { ticks: { color: '#94a3b8', callback: v => '$' + v }, grid: { color: '#1e293b' } }
+          }
+        }
+      });
+    }
+
+    function renderActorChart() {
+      const ctx = document.getElementById('actorChart').getContext('2d');
+      if (actorChartInst) actorChartInst.destroy();
+
+      const list = (DATA.actors[currentAccount] || DATA.actors['ALL'] || []).slice(0, 8);
+      actorChartInst = new Chart(ctx, {
+        type: 'doughnut',
+        data: {
+          labels: list.map(x => `${x.actor} (${fmtUsd(x.cost_usd)})`),
+          datasets: [{
+            data: list.map(x => x.cost_usd),
+            backgroundColor: ['#38bdf8', '#a855f7', '#10b981', '#f59e0b', '#f43f5e', '#6366f1', '#14b8a6', '#eab308'],
+            borderColor: '#131b2e',
+            borderWidth: 2
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { position: 'right', labels: { color: '#cbd5e1', font: { size: 11 } } }
+          }
+        }
+      });
+    }
+
+    function renderToolChart() {
+      const ctx = document.getElementById('toolChart').getContext('2d');
+      if (toolChartInst) toolChartInst.destroy();
+
+      const list = (DATA.tools[currentAccount] || DATA.tools['ALL'] || []).slice(0, 10);
+      toolChartInst = new Chart(ctx, {
+        type: 'bar',
+        data: {
+          labels: list.map(x => x.label),
+          datasets: [
+            {
+              label: 'Induced Cache-Write Tokens',
+              data: list.map(x => x.induced_cw),
+              backgroundColor: '#f59e0b',
+              borderRadius: 4
+            },
+            {
+              label: 'Direct Payload Tokens',
+              data: list.map(x => x.payload_tok),
+              backgroundColor: '#38bdf8',
+              borderRadius: 4
+            }
+          ]
+        },
+        options: {
+          indexAxis: 'y',
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { labels: { color: '#cbd5e1', font: { size: 11 } } },
+            tooltip: { callbacks: { label: (c) => `${c.dataset.label}: ${fmtNum(c.raw)} tok` } }
+          },
+          scales: {
+            x: { ticks: { color: '#94a3b8', callback: v => fmtNum(v) }, grid: { color: '#1e293b' } },
+            y: { ticks: { color: '#cbd5e1', font: { size: 11 } }, grid: { display: false } }
+          }
+        }
+      });
+    }
+
+    function renderWoWTable() {
+      const key = currentAccount === 'ALL' ? 'ALL ACCOUNTS' : currentAccount;
+      const cur = (DATA.wow_curr && DATA.wow_curr[key]) || {};
+      const prv = (DATA.wow_prev && DATA.wow_prev[key]) || {};
+
+      const rows = [
+        ['Active Sessions', prv.sessions || 0, cur.sessions || 0, fmtNum],
+        ['API Turns (Requests)', prv.turns || 0, cur.turns || 0, fmtNum],
+        ['Total Tokens Processed', prv.total_tokens || 0, cur.total_tokens || 0, fmtNum],
+        ['Cache Creation (Write) Tok', prv.cache_write_tokens || 0, cur.cache_write_tokens || 0, fmtNum],
+        ['Output + Thinking Tokens', prv.output_tokens || 0, cur.output_tokens || 0, fmtNum],
+        ['Subagent Token Volume', prv.subagent_tokens || 0, cur.subagent_tokens || 0, fmtNum],
+        ['MCP Payload Tokens', prv.mcp_tokens || 0, cur.mcp_tokens || 0, fmtNum],
+        ['Tool Errors', prv.tool_errors || 0, cur.tool_errors || 0, fmtNum],
+        ['Estimated API Cost ($)', prv.cost_usd || 0, cur.cost_usd || 0, fmtUsd]
+      ];
+
+      const html = `
+        <table>
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th class="num">Prev 7 Days</th>
+              <th class="num">Last 7 Days</th>
+              <th class="num">WoW Delta</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map(([label, p, c, fn]) => {
+              let deltaStr = '0.0%';
+              let cls = '';
+              if (p === 0 && c > 0) { deltaStr = '+NEW ▲'; cls = 'up-bad'; }
+              else if (p > 0) {
+                const pct = ((c - p) / p) * 100;
+                deltaStr = `${pct >= 0 ? '+' : ''}${pct.toFixed(1)}% ${pct >= 0 ? '▲' : '▼'}`;
+                cls = pct > 5 ? 'up-bad' : (pct < -5 ? 'down-good' : '');
+              }
+              return `
+                <tr>
+                  <td>${label}</td>
+                  <td class="num">${fn(p)}</td>
+                  <td class="num"><strong>${fn(c)}</strong></td>
+                  <td class="num ${cls}">${deltaStr}</td>
+                </tr>
+              `;
+            }).join('')}
+          </tbody>
+        </table>
+      `;
+      document.getElementById('wow-table-wrap').innerHTML = html;
+    }
+
+    function renderAnomalies() {
+      const list = DATA.anomalies.filter(a => currentAccount === 'ALL' || a.account === currentAccount);
+      const el = document.getElementById('anomaly-container');
+      if (!list.length) {
+        el.innerHTML = `<div style="color:#34d399;padding:16px;">✓ No anomalies detected for ${currentAccount}!</div>`;
+        return;
+      }
+      el.innerHTML = list.slice(0, 20).map(a => `
+        <div class="anomaly-item ${a.severity}">
+          <div class="anomaly-top">
+            <span><strong>[${a.severity}] ${a.mode}</strong> • ${a.account}</span>
+            <span>Session <code>${a.session_id.slice(0, 10)}</code> • ${a.time_str}</span>
+          </div>
+          <div class="anomaly-what">${a.summary}</div>
+          <div class="anomaly-fix">💡 ${a.remediation}</div>
+        </div>
+      `).join('');
+    }
+
+    function renderSessionsTable() {
+      const list = DATA.top_sessions.filter(s => currentAccount === 'ALL' || s.account === currentAccount).slice(0, 15);
+      document.getElementById('sessions-table-wrap').innerHTML = `
+        <table>
+          <thead>
+            <tr>
+              <th>Account</th>
+              <th>Session ID</th>
+              <th>Last Active</th>
+              <th class="num">Turns</th>
+              <th class="num">Subagents</th>
+              <th class="num">Total Tokens</th>
+              <th class="num">Cache Write</th>
+              <th class="num">Subagent Share</th>
+              <th class="num">Total Cost</th>
+              <th>Project</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${list.map(s => {
+              const subPct = s.total_tok > 0 ? ((s.sub_tok / s.total_tok) * 100).toFixed(1) : '0.0';
+              return `
+                <tr>
+                  <td><span class="badge badge-active">${s.account}</span></td>
+                  <td><code>${s.session_id.slice(0, 10)}</code></td>
+                  <td>${s.end_time}</td>
+                  <td class="num">${s.turns}</td>
+                  <td class="num">${s.subagents}</td>
+                  <td class="num">${fmtNum(s.total_tok)}</td>
+                  <td class="num">${fmtNum(s.cw_tok)}</td>
+                  <td class="num">${subPct}% (${fmtUsd(s.sub_cost)})</td>
+                  <td class="num"><strong style="color:#34d399">${fmtUsd(s.total_cost)}</strong></td>
+                  <td style="color:var(--muted);font-size:0.78rem">${s.project.slice(-38)}</td>
+                </tr>
+              `;
+            }).join('')}
+          </tbody>
+        </table>
+      `;
+    }
+
+    init();
+  </script>
+</body>
+</html>
+"""
+
+
+def cmd_html(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    report_data = build_html_report_data(conn, days=args.days)
+    out_path = Path(args.output).expanduser() if getattr(args, "output", None) else (HOME / ".claude" / "reports" / "usage_dashboard.html")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    html_str = HTML_TEMPLATE.replace("__REPORT_DATA_JSON__", json.dumps(report_data, ensure_ascii=False))
+    out_path.write_text(html_str, encoding="utf-8")
+
+    print_header("📊 INTERACTIVE HTML ANALYTICS & PREDICTIVE FORECAST EXPORT")
+    print(f"  {green('✓ Generated HTML dashboard:')} {bold(str(out_path))}")
+    print(f"  {cyan('▸ File URL :')} file://{out_path}")
+
+    # Print quick terminal summary of the predictive forecast
+    f_all = report_data["forecasts"].get("ALL", {})
+    q_all = report_data["quota_predictions"].get("ALL", {})
+    print(f"\n  {bold('🔮 Predictive Forecast Summary (All Accounts Combined):')}")
+    print(f"  • Rolling 5h Window Burn : {fmt_usd(q_all.get('cur_5h_cost', 0))} / {fmt_usd(q_all.get('p90_5h_cost', 0))} P90 Ceiling ({q_all.get('fill_pct', 0)}% fill — {yellow(q_all.get('eta_str', 'Safe'))})")
+    print(f"  • Next 7-Day Projection  : {green(fmt_usd(f_all.get('cost_7d', 0)))} ({fmt_num(f_all.get('tok_7d', 0))} total tokens, {fmt_num(f_all.get('fresh_7d', 0))} fresh/cache-write)")
+    print(f"  • 30-Day Run-Rate Proj   : {magenta(fmt_usd(f_all.get('cost_30d', 0)))} ({fmt_num(f_all.get('tok_30d', 0))} total tokens)")
+
+    print(f"\n  {bold('▸ Per-Account 5h Quota & 7-Day Forecast Breakdown:')}")
+    print(f"  {'Account':<17} {'5h Burn ($)':>12} {'5h P90 Cap':>12} {'5h Fill %':>10} {'Exhaustion ETA':>20} {'Next 7d Proj':>14} {'30d Run-Rate':>14}")
+    print("  " + "─" * 105)
+    for acct in report_data["accounts"]:
+        qa = report_data["quota_predictions"].get(acct, {})
+        fa = report_data["forecasts"].get(acct, {})
+        print(
+            f"  {cyan(f'{acct:<17}')} {fmt_usd(qa.get('cur_5h_cost', 0)):>12} {fmt_usd(qa.get('p90_5h_cost', 0)):>12} "
+            f"{qa.get('fill_pct', 0):>9.1f}% {qa.get('eta_str', 'Safe'):>20} "
+            f"{green(f'{fmt_usd(fa.get('cost_7d', 0)):>14}')} {fmt_usd(fa.get('cost_30d', 0)):>14}"
+        )
+
+    if getattr(args, "serve", False):
+        import http.server
+        import socketserver
+
+        port = int(getattr(args, "port", 3821) or 3821)
+        serve_dir = str(out_path.parent)
+        fname = out_path.name
+
+        class Handler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *h_args: Any, **h_kwargs: Any) -> None:
+                super().__init__(*h_args, directory=serve_dir, **h_kwargs)
+
+        print(f"\n  {green(f'🌐 Serving live at http://localhost:{port}/{fname} (Press Ctrl+C to stop)')}")
+        with socketserver.TCPServer(("", port), Handler) as httpd:
+            try:
+                httpd.serve_forever()
+            except KeyboardInterrupt:
+                print("\n  Stopped local server.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="claude-profiler: Multi-Account Token Profiler, Burn Rate & Post-Mortem Analyzer for Claude Code"
@@ -1810,7 +3027,7 @@ def build_parser() -> argparse.ArgumentParser:
         "command",
         nargs="?",
         default="dashboard",
-        choices=["dashboard", "summary", "burn", "who", "actors", "wow", "compare", "postmortem", "investigate", "sync", "hook"],
+        choices=["dashboard", "summary", "burn", "who", "actors", "wow", "compare", "postmortem", "investigate", "html", "export", "sync", "hook"],
         help="Subcommand to execute (default: dashboard)",
     )
     p.add_argument(
@@ -1829,8 +3046,25 @@ def build_parser() -> argparse.ArgumentParser:
         "-d",
         "--days",
         type=int,
-        default=7,
-        help="Lookback window in days for burn/who/postmortem reports (default: 7)",
+        default=14,
+        help="Lookback window in days for burn/who/postmortem/html reports (default: 14)",
+    )
+    p.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="Output path for HTML report (default: ~/.claude/reports/usage_dashboard.html)",
+    )
+    p.add_argument(
+        "--serve",
+        action="store_true",
+        help="Serve the generated HTML dashboard over HTTP (default port 3821)",
+    )
+    p.add_argument(
+        "--port",
+        type=int,
+        default=3821,
+        help="Port for --serve (default: 3821)",
     )
     p.add_argument(
         "--force",
@@ -1868,6 +3102,8 @@ def main() -> int:
     elif args.command in ("postmortem", "investigate"):
         args.session_id = args.extra
         cmd_postmortem(conn, args)
+    elif args.command in ("html", "export"):
+        cmd_html(conn, args)
 
     print()
     conn.close()

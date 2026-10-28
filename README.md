@@ -77,7 +77,12 @@ claude-profiler postmortem --days 14
 # 5. Deep-dive a specific session (turn-by-turn cost + all subagents + cold-cache bust timeline)
 claude-profiler postmortem <session_id_prefix>
 
-# 6. Force full resync of all transcript files
+# 6. Generate interactive dark-mode HTML dashboard with Chart.js graphs & 7d/30d/5h predictions
+claude-profiler html
+claude-profiler html -o ~/Desktop/claude_report.html
+claude-profiler html --serve --port 3821
+
+# 7. Force full resync of all transcript files
 claude-profiler sync --force
 ```
 
