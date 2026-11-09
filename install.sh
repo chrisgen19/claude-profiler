@@ -28,6 +28,15 @@ from pathlib import Path
 home = Path.home()
 hook_cmd = "python3 ~/.claude/hooks/token_profiler.py hook"
 events_to_hook = ["PostToolUse", "SubagentStop", "Stop", "SessionEnd"]
+# Either spelling means the profiler is already hooked in: the one this script
+# writes, or the guarded `~/.local/bin/claude-profiler hook <Event>` form that
+# chrisgen19/claude-global-and-projects tracks. Matching only the first added a
+# second set of hooks to profiles deployed from that repo, recording every event twice.
+hook_markers = ("token_profiler.py", "claude-profiler hook")
+
+
+def is_profiler_hook(command):
+    return any(marker in (command or "") for marker in hook_markers)
 
 for d in sorted(home.glob(".claude*")):
     if not d.is_dir():
@@ -44,7 +53,7 @@ for d in sorted(home.glob(".claude*")):
     for ev in events_to_hook:
         ev_list = hooks.setdefault(ev, [])
         already = any(
-            any("token_profiler.py" in (h.get("command") or "") for h in item.get("hooks", []))
+            any(is_profiler_hook(h.get("command")) for h in item.get("hooks", []))
             for item in ev_list
             if isinstance(item, dict)
         )
